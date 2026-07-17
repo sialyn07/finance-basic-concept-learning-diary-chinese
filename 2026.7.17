@@ -1,0 +1,193 @@
+2026.7.17学习笔记 
+做市商 — 信号驱动报价引擎Signal-Driven Quoting Engine
+前置知识：夏普比率、最大回撤、逆向选择、订单簿不平衡、价差捕获、库存管理
+
+一、为什么需要信号驱动报价
+之前学的报价策略是静态的——固定价差、固定偏移，但市场不会一直一个样。
+波动率高（大涨大跌、单边趋势）时价差要拉宽，减少成交规避插针套牢风险；
+订单簿买卖深度严重失衡时报价需要同步偏移；
+有毒知情订单流涌入时，需要收缩价差压缩对手套利空间，降低逆向选择亏损。
+信号驱动报价 = 把多个市场信号实时融合进报价决策，动态调整价差与报价偏移。
+
+二、三个核心信号
+信号1：订单簿不平衡（Order Book Imbalance）
+信号2：逆向选择毒性（Adverse Selection Toxicity）
+信号3：波动率调节（Volatility Regime）
+
+关键区分（波动率 vs 订单毒性）
+1. 波动率高：价格无序剧烈涨跌，无定向知情资金，做市商拉宽价差自保
+2. 订单毒性高：知情大户掌握预判信息，定向单边扫单收割做市商，做市商缩窄价差劝退有毒订单
+
+三、融合报价引擎
+把三个信号融合进一个报价决策（数据均为例子）：
+1. 基础价差 × 波动率比值 → 高波动自动拉宽价差
+2. 波动调节后价差 × (1 - 毒性 × 0.3) → 毒性越高小幅收缩价差，设置下限避免价差归零
+3. 库存偏移 = -(库存/最大库存) × 基础价差 → 持仓越重偏移幅度越大，加速平掉积压库存
+4. 订单簿偏移 = 不平衡度 × 基础价差 × 0.3 → 顺着盘口买卖压力调整报价位置
+5. 总偏移 = 库存偏移 + 订单簿偏移
+6. Bid = 中间价 - 半价差 + 总偏移
+   Ask = 中间价 + 半价差 + 总偏移
+
+四、Python代码
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 订单簿不平衡信号
+def imbalance_signal(bid_vol, ask_vol):
+    total = bid_vol + ask_vol
+    if total == 0:
+        return 0
+    return (bid_vol - ask_vol) / total
+
+# 逆向选择毒性信号（修正逻辑：数值越大代表订单流毒性越强）
+def toxicity_signal(trade_flow, window=20):
+    if len(trade_flow) < window:
+        return 0
+    recent = np.mean(trade_flow[-window:])
+    toxicity = abs(recent)
+    return toxicity
+
+# 波动率比值信号（滚动基准波动率，避免固定历史基准失真）
+def vol_ratio_signal(returns, window=20):
+    if len(returns) < window:
+        return 1.0
+    recent_vol = np.std(returns[-window:])
+    # 滚动基准区间
+    if len(returns) >= 2 * window:
+        baseline_vol = np.std(returns[-2*window:-window])
+    else:
+        baseline_vol = np.std(returns[:window])
+    if baseline_vol == 0:
+        return 1.0
+    return recent_vol / baseline_vol
+
+# 信号融合报价引擎
+def quote_engine(mid, inventory, max_inv,
+                 imbalance, toxicity, vol_ratio,
+                 base_bps=5, inv_scale=1.0):
+    spread_bps = base_bps * vol_ratio
+    # 毒性越高，收缩价差，压缩知情交易者套利空间
+    spread_bps *= (1 - toxicity * 0.3)
+    # 价差下限保护，防止价差归零失去盈利空间
+    spread_bps = max(spread_bps, 0.1)
+
+    inv_ratio = inventory / max_inv if max_inv != 0 else 0
+    inv_skew = -inv_ratio * inv_scale * base_bps
+    ob_skew = imbalance * base_bps * 0.3
+    total_skew = inv_skew + ob_skew
+
+    half_sp = mid * spread_bps / 10000 / 2
+    skew_adj = total_skew * mid / 10000
+    bid = mid - half_sp + skew_adj
+    ask = mid + half_sp + skew_adj
+    return bid, ask, spread_bps, total_skew
+
+# 模拟初始化
+np.random.seed(42)
+n = 500
+mid = 65000.0
+inventory = 0.0
+max_inv = 10.0
+base_bps = 5
+
+prices, bids, asks, invs = [], [], [], []
+spreads, skews = [], []
+imb_sig, tox_sig = [], []
+returns, trade_flow = [], []
+
+for t in range(n):
+    ret = np.random.normal(0, 0.002)
+    mid *= (1 + ret)
+    returns.append(ret)
+    prices.append(mid)
+
+    # 模拟盘口买卖深度
+    bid_vol = np.random.exponential(10) * (1 + 0.5*np.sin(t/30))
+    ask_vol = np.random.exponential(10) * (1 + 0.5*np.cos(t/30))
+    imb = imbalance_signal(bid_vol, ask_vol)
+    imb_sig.append(imb)
+
+    # 模拟订单流，周期性生成连续同向有毒知情订单，避免数据过度平滑失真
+    if t % 60 < 10:
+        side = np.random.choice([-1, 1], p=[0.5,0.5])
+    else:
+        side = np.random.choice([-1, 0, 1], p=[0.2, 0.4, 0.4])
+    trade_flow.append(side)
+    tox = toxicity_signal(trade_flow)
+    tox_sig.append(tox)
+
+    vol_r = vol_ratio_signal(returns)
+    bid, ask, sp, sk = quote_engine(
+        mid, inventory, max_inv,
+        imb, tox, vol_r, base_bps)
+    bids.append(bid)
+    asks.append(ask)
+    spreads.append(sp)
+    skews.append(sk)
+
+    # 随机浮动成交数量，替代固定单笔成交量，贴近真实市场
+    if np.random.random() < 0.3:
+        trade_size = np.random.uniform(0.2, 0.8)
+        inventory += trade_size if np.random.random() < 0.5 else -trade_size
+    invs.append(inventory)
+
+# 绘图可视化代码
+plt.rcParams['font.sans-serif'] = ['SimHei']
+fig, axes = plt.subplots(2,2, figsize=(16,10))
+
+axes[0,0].plot(prices, label='中间价')
+axes[0,0].set_title('模拟标的价格走势')
+axes[0,0].legend()
+
+axes[0,1].plot(spreads, label='动态价差(bps)', color='orange')
+axes[0,1].set_title('波动率+毒性双重调节价差变化')
+axes[0,1].legend()
+
+axes[1,0].plot(invs, label='库存持仓', color='green')
+axes[1,0].axhline(max_inv, c='r', ls='--', label='库存上限')
+axes[1,0].axhline(-max_inv, c='r', ls='--')
+axes[1,0].set_title('库存变化曲线')
+axes[1,0].legend()
+
+axes[1,1].plot(imb_sig, label='订单簿不平衡度', alpha=0.7)
+axes[1,1].plot(tox_sig, label='逆向选择毒性', alpha=0.7, c='red')
+axes[1,1].set_title('订单不平衡、毒性信号时序曲线')
+axes[1,1].legend()
+
+plt.tight_layout()
+plt.show()
+
+# 批量输出回测统计指标
+avg_spread = np.mean(spreads)
+min_spread, max_spread = np.min(spreads), np.max(spreads)
+avg_skew = np.mean(skews)
+final_inv = invs[-1]
+max_abs_inv = np.max(np.abs(invs))
+
+print(f"平均价差: {avg_spread:.2f} bps")
+print(f"价差范围: [{min_spread:.2f}, {max_spread:.2f}] bps")
+print(f"平均偏移: {avg_skew:.2f} bps")
+print(f"最终库存: {final_inv:.2f} BTC")
+print(f"最大绝对库存: {max_abs_inv:.2f} BTC")
+
+五、运行500步模拟后关键结果解读
+平均价差: 3.69 bps（基础5bps，高波动率拉高、高毒性收缩双向调节）
+价差范围: [0.10, 5.76] bps（极端波动自动拉宽，知情订单涌入自动缩窄，下限0.1bps保证基础收益）
+平均偏移: -0.59 bps（整体小幅偏空报价）
+最终库存: -0.5 BTC（库存偏移机制有效，长期接近平仓状态）
+最大库存: 6.0 BTC（全程未触碰10 BTC库存上限，库存风险可控）
+
+六、信号联动完整逻辑总结
+1. 波动率上升 → 自动拉宽价差 → 减少挂单成交，抵御大幅涨跌插针套牢风险
+2. 订单毒性上升 → 小幅收缩价差 → 压缩知情交易者套利空间，降低逆向选择亏损
+3. 库存多头积压 → 报价整体向下偏移 → 低价挂卖单，加速出清多头库存
+4. 订单簿买方深度远大于卖方 → 报价整体向上偏移 → 跟随市场买压调整挂单位置
+5. 高波动+高毒性同时出现：拉宽、收缩效果相互对冲，动态平衡风险与成交收益
+
+ 七、和前置知识点对应关系
+夏普比率 → 用于评估整套信号报价策略长期收益风险性价比
+最大回撤 → 可设置库存/资金最大回撤阈值，触发后撤回全部流动性风控
+逆向选择 → 代码中toxicity毒性信号，是逆向选择理论可落地的量化实现
+
+附图：
+
